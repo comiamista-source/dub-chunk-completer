@@ -1,0 +1,145 @@
+name: Complete Failed Chunks
+
+# Scans Dubz/Chunks on Drive. Each chunk file becomes its own matrix job, gets
+# dubbed, and the dubbed result is uploaded to Dubz/ChunksDone. The raw original
+# is moved to Dubz/Chunks/archive so it is not processed twice.
+# Manual only - press Run.
+#
+# Secrets: RCLONE_CONF (required), DUB_BASE_URL (optional).
+
+on:
+  workflow_dispatch:
+    inputs:
+      src:
+        description: "Source language"
+        default: "Hindi"
+      target:
+        description: "Target language"
+        default: "English"
+      genre:
+        description: "Genre"
+        default: "monologue"
+      speakers:
+        description: "Number of speakers"
+        default: "1"
+      tries:
+        description: "Retries per chunk (these are leftovers - retry harder)"
+        default: "3"
+      chunks_dir:
+        description: "Drive folder with failed chunks"
+        default: "Dubz/Chunks"
+      done_dir:
+        description: "Drive folder for completed chunks"
+        default: "Dubz/ChunksDone"
+
+concurrency:
+  group: chunk-completer-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  SRC: ${{ github.event.inputs.src || 'Hindi' }}
+  TGT: ${{ github.event.inputs.target || 'English' }}
+  GENRE: ${{ github.event.inputs.genre || 'monologue' }}
+  SPEAKERS: ${{ github.event.inputs.speakers || '1' }}
+  TRIES: ${{ github.event.inputs.tries || '3' }}
+  CHUNKS_DIR: ${{ github.event.inputs.chunks_dir || 'Dubz/Chunks' }}
+  DONE_DIR: ${{ github.event.inputs.done_dir || 'Dubz/ChunksDone' }}
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+      count: ${{ steps.build.outputs.count }}
+    steps:
+      - name: Connect Google Drive
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          if [ -z "$RCLONE_CONF" ]; then echo "::error::RCLONE_CONF secret not set."; exit 1; fi
+          curl -fsSL https://rclone.org/install.sh | sudo bash >/dev/null 2>&1
+          mkdir -p ~/.config/rclone
+          printf '%s' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+      - name: Build matrix from chunk files
+        id: build
+        run: |
+          rclone lsf "gdrive:${CHUNKS_DIR}" --files-only > all.txt 2>/dev/null || true
+          grep -iE '\.(mp4|mkv|mov|webm|avi|m4v|ts)$' all.txt > chunks.txt || true
+          COUNT=$(grep -c . chunks.txt 2>/dev/null || true); COUNT=${COUNT:-0}
+          echo "Found $COUNT chunk(s) in ${CHUNKS_DIR}:"; cat chunks.txt || true
+          ITEMS=$(jq -R -s -c 'split("\n") | map(select(length>0)) | .[0:256] | map({ref: .})' chunks.txt)
+          echo "matrix={\"item\":$ITEMS}" >> "$GITHUB_OUTPUT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+  dub:
+    needs: scan
+    if: ${{ needs.scan.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.scan.outputs.matrix) }}
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ffmpeg + rclone + deps
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg jq >/dev/null
+          curl -fsSL https://rclone.org/install.sh | sudo bash >/dev/null 2>&1
+          python3 -m pip install -q --upgrade pip requests
+      - name: Connect Google Drive
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+      - name: Get the chunk
+        id: get
+        env:
+          REF: ${{ matrix.item.ref }}
+        run: |
+          mkdir -p input output
+          if ! rclone lsf "gdrive:${CHUNKS_DIR}/${REF}" >/dev/null 2>&1; then
+            echo "::notice::${REF} no longer in ${CHUNKS_DIR} - already handled."
+            echo "have=no" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          rclone copy "gdrive:${CHUNKS_DIR}/${REF}" input/ --drive-chunk-size 64M -v
+          IN=$(ls input/ 2>/dev/null | head -n1)
+          if [ -z "$IN" ]; then echo "::error::Could not download ${REF}"; echo "have=no" >> "$GITHUB_OUTPUT"; exit 1; fi
+          echo "have=yes" >> "$GITHUB_OUTPUT"; echo "Got: $IN"
+      - name: Dub the chunk
+        if: steps.get.outputs.have == 'yes'
+        env:
+          DUB_BASE_URL: ${{ secrets.DUB_BASE_URL }}
+          REF: ${{ matrix.item.ref }}
+        run: |
+          IN=$(ls input/ | head -n1)
+          echo "==> Dubbing chunk: $IN"
+          python dub_chunk.py "$GITHUB_WORKSPACE/input/$IN" \
+            --src "$SRC" --target "$TGT" --genre "$GENRE" --speakers "$SPEAKERS" \
+            --tries "$TRIES" --out "$GITHUB_WORKSPACE/output/$IN" || true
+      - name: Upload completed chunk + archive original
+        if: steps.get.outputs.have == 'yes'
+        env:
+          REF: ${{ matrix.item.ref }}
+        run: |
+          if [ -n "$(ls -A output/ 2>/dev/null)" ]; then
+            rclone copy output/ "gdrive:${DONE_DIR}" --transfers 2 --drive-chunk-size 64M -v
+            rclone moveto "gdrive:${CHUNKS_DIR}/${REF}" "gdrive:${CHUNKS_DIR}/archive/${REF}" -v || \
+              echo "::warning::Could not archive ${REF}."
+            echo "==> ${REF} completed -> ${DONE_DIR}."
+          else
+            echo "::warning::${REF} produced no output (still failed). Left in ${CHUNKS_DIR} for next run."
+          fi
+      - name: Backup in Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ strategy.job-index }}
+          path: output/
+          if-no-files-found: ignore
